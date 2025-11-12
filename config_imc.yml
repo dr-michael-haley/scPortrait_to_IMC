@@ -1,0 +1,9 @@
+---
+name: "IMC External Segmentation"
+HDF5CellExtraction:
+  threads: 32          # adjust based on available CPU cores
+  image_size: 128      # resize per-cell crops
+  normalize_output: true
+  normalization_range: [0.01, 0.99]
+  compression: "lzf"
+  cache: "./cache"
