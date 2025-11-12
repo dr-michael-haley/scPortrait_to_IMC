@@ -51,6 +51,18 @@ def _stems_in_dir(directory: Path, extensions: set[str]) -> set[str]:
     return stems
 
 
+def _derive_channel_name(path: Path) -> str:
+    """
+    Extract human-readable channel name from filenames formatted as
+    {chan#}_{roi#}_{str}_{channel name}.tiff
+    """
+    stem = path.stem
+    parts = stem.split("_", 3)
+    if len(parts) == 4:
+        return parts[3]
+    return stem
+
+
 def _collect_rois(images_root: Path, mask_dir: Path, extensions: set[str]) -> list[str]:
     if not mask_dir.is_dir():
         raise ValueError(f"Mask directory {mask_dir} not found.")
@@ -107,7 +119,7 @@ def _channel_files_and_names(roi_dir: Path, extensions: set[str]) -> tuple[list[
     if not tiffs:
         raise ValueError(f"No channel images found in {roi_dir}.")
     files = [str(path) for path in tiffs]
-    names = [path.stem for path in tiffs]
+    names = [_derive_channel_name(path) for path in tiffs]
     return files, names
 
 

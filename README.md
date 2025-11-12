@@ -8,6 +8,7 @@ Batch-load Imaging Mass Cytometry (IMC) datasets into [scPortrait](https://githu
 C:\GitHub\scPortrait_to_IMC
 ├── imc_to_single_cells.py  # helper script
 ├── config_imc.yml          # sample extraction config
+├── run_imc.slurm           # example SLURM batch script
 └── README.md
 ```
 
@@ -17,19 +18,19 @@ Keep your data elsewhere, e.g.:
 IMC_RUN/
 ├── images/
 │   ├── ROI_001/
-│   │   ├── CD45.tiff
-│   │   ├── PanCK.tiff
-│   │   └── DNA1.tiff
+│   │   ├── 47_001_Pt198_PanCK.tiff
+│   │   ├── 48_001_Ir191_DNA1.tiff
+│   │   └── 12_001_Yb174_CD45.tiff
 │   └── ROI_002/
-│       ├── CD45.tiff
-│       ├── PanCK.tiff
-│       └── DNA1.tiff
+│       ├── 47_002_Pt198_PanCK.tiff
+│       ├── 48_002_Ir191_DNA1.tiff
+│       └── 12_002_Yb174_CD45.tiff
 └── masks/
     ├── ROI_001.tiff
     └── ROI_002.tiff
 ```
 
-Each ROI has its own folder containing all channel TIFFs for that ROI. The mask directory contains one whole-cell mask per ROI (same filename stem as the ROI directory).
+Each ROI has its own folder containing all channel TIFFs for that ROI. Filenames should follow `{chan#}_{roi#}_{str}_{channel name}.tiff` so the helper can infer the clean channel name from the final segment (e.g., `..._PanCK`). The mask directory contains one whole-cell mask per ROI (same filename stem as the ROI directory).
 
 ## Configuration
 
@@ -78,6 +79,16 @@ print("Failed:", failures)
 ```
 
 `successes` maps each ROI name to the generated `single_cells.h5sc` path, while `failures` (if any) maps ROI names to the raised exception for further inspection.
+
+### SLURM batch example
+
+Submit `run_imc.slurm` to execute the helper on an HPC cluster:
+
+```bash
+sbatch C:\GitHub\scPortrait_to_IMC\run_imc.slurm
+```
+
+Adjust the SBATCH resources, module/conda commands, and file paths inside the script to match your cluster environment. Logs land in `run_imc.slurm`'s `logs/` folder (created automatically by SLURM).
 
 For each ROI `<ID>`, the script creates `--projects-root/<ID>/.../single_cells.h5sc`. Inspect the result with:
 
