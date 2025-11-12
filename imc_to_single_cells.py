@@ -15,6 +15,7 @@ from typing import Iterable
 
 import numpy as np
 from tifffile import imread
+from skimage.segmentation import expand_labels
 
 from scportrait.pipeline._utils.constants import DEFAULT_SEGMENTATION_DTYPE
 from scportrait.pipeline.extraction import HDF5CellExtraction
@@ -33,13 +34,13 @@ def _normalize_ext(exts: Iterable[str]) -> set[str]:
     return normalized
 
 
-def _list_channel_dirs(channels_root: Path) -> list[Path]:
-    if not channels_root.is_dir():
-        raise ValueError(f"Channels directory {channels_root} not found.")
-    channel_dirs = sorted([p for p in channels_root.iterdir() if p.is_dir()])
-    if not channel_dirs:
-        raise ValueError(f"No channel subdirectories found in {channels_root}.")
-    return channel_dirs
+def _list_roi_dirs(images_root: Path) -> list[Path]:
+    if not images_root.is_dir():
+        raise ValueError(f"Images directory {images_root} not found.")
+    roi_dirs = sorted([p for p in images_root.iterdir() if p.is_dir()])
+    if not roi_dirs:
+        raise ValueError(f"No ROI subdirectories found in {images_root}.")
+    return roi_dirs
 
 
 def _stems_in_dir(directory: Path, extensions: set[str]) -> set[str]:
@@ -50,17 +51,16 @@ def _stems_in_dir(directory: Path, extensions: set[str]) -> set[str]:
     return stems
 
 
-def _collect_rois(channels_root: Path, mask_dir: Path, extensions: set[str]) -> list[str]:
+def _collect_rois(images_root: Path, mask_dir: Path, extensions: set[str]) -> list[str]:
     if not mask_dir.is_dir():
         raise ValueError(f"Mask directory {mask_dir} not found.")
-    roi_ids = _stems_in_dir(mask_dir, extensions)
+    roi_dirs = _list_roi_dirs(images_root)
+    roi_names = {d.name for d in roi_dirs}
+    mask_ids = _stems_in_dir(mask_dir, extensions)
+    roi_ids = sorted(roi_names & mask_ids)
     if not roi_ids:
-        raise ValueError(f"No mask files with extensions {sorted(extensions)} in {mask_dir}.")
-    for channel_dir in _list_channel_dirs(channels_root):
-        roi_ids &= _stems_in_dir(channel_dir, extensions)
-    if not roi_ids:
-        raise ValueError("No overlapping ROI identifiers between channel folders and mask directory.")
-    return sorted(roi_ids)
+        raise ValueError("No overlapping ROI identifiers between ROI folders and mask directory.")
+    return roi_ids
 
 
 def _resolve_file(directory: Path, roi: str, extensions: set[str]) -> Path:
@@ -82,23 +82,32 @@ def _spatial_shape(shape: tuple[int, ...]) -> tuple[int, int]:
     raise ValueError(f"Cannot infer 2D plane from shape {shape}.")
 
 
-def _load_mask(mask_path: Path, expected_shape: tuple[int, int]) -> np.ndarray:
+def _load_mask(mask_path: Path, expected_shape: tuple[int, int], expand_px: int = 0) -> np.ndarray:
     mask = imread(mask_path)
     spatial_shape = _spatial_shape(mask.shape)
     if spatial_shape != expected_shape:
         raise ValueError(
             f"Mask {mask_path} has shape {spatial_shape}, expected {expected_shape} based on channel data."
         )
-    return np.squeeze(mask).astype(DEFAULT_SEGMENTATION_DTYPE, copy=False)
+    mask_data = np.squeeze(mask)
+    if expand_px > 0:
+        mask_data = expand_labels(mask_data.astype(np.int32, copy=False), distance=expand_px)
+    return mask_data.astype(DEFAULT_SEGMENTATION_DTYPE, copy=False)
 
 
-def _channel_files_and_names(channel_dirs: list[Path], roi: str, extensions: set[str]) -> tuple[list[str], list[str]]:
-    files: list[str] = []
-    names: list[str] = []
-    for channel_dir in channel_dirs:
-        path = _resolve_file(channel_dir, roi, extensions)
-        files.append(str(path))
-        names.append(channel_dir.name)
+def _channel_files_and_names(roi_dir: Path, extensions: set[str]) -> tuple[list[str], list[str]]:
+    tiffs = sorted(
+        [
+            path
+            for ext in extensions
+            for path in roi_dir.glob(f"*{ext}")
+            if path.is_file()
+        ]
+    )
+    if not tiffs:
+        raise ValueError(f"No channel images found in {roi_dir}.")
+    files = [str(path) for path in tiffs]
+    names = [path.stem for path in tiffs]
     return files, names
 
 
@@ -106,22 +115,23 @@ def _run_single_roi(
     roi: str,
     project_root: Path,
     config_path: Path,
-    channel_dirs: list[Path],
+    roi_dir: Path,
     mask_dir: Path,
     extensions: set[str],
     overwrite: bool,
     debug: bool,
+    mask_expand_px: int,
 ) -> Path:
     project_dir = project_root / roi
     project_dir.mkdir(parents=True, exist_ok=True)
     cache_dir = project_dir / "cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    channel_files, channel_names = _channel_files_and_names(channel_dirs, roi, extensions)
+    channel_files, channel_names = _channel_files_and_names(roi_dir, extensions)
     example_image = imread(channel_files[0])
     spatial_shape = _spatial_shape(example_image.shape)
     mask_path = _resolve_file(mask_dir, roi, extensions)
-    mask = _load_mask(mask_path, spatial_shape)
+    mask = _load_mask(mask_path, spatial_shape, expand_px=mask_expand_px)
 
     project = Project(
         project_location=str(project_dir),
@@ -180,6 +190,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=CHANNEL_EXT_DEFAULT,
         help=f"Extensions for both channel images and masks (default: {CHANNEL_EXT_DEFAULT}).",
     )
+    parser.add_argument(
+        "--mask-expand-px",
+        type=int,
+        default=0,
+        help="Expand each labelled cell mask by the given number of pixels (uses skimage.segmentation.expand_labels).",
+    )
     parser.add_argument("--overwrite", action="store_true", help="Overwrite any existing project directories.")
     parser.add_argument("--debug", action="store_true", help="Enable verbose project logging.")
     return parser.parse_args(argv)
@@ -188,21 +204,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     extensions = _normalize_ext(args.image_ext)
-    channel_dirs = _list_channel_dirs(args.channels_dir)
+    roi_dirs = {roi_dir.name: roi_dir for roi_dir in _list_roi_dirs(args.channels_dir)}
     roi_ids = args.roi_list or _collect_rois(args.channels_dir, args.mask_dir, extensions)
 
     args.projects_root.mkdir(parents=True, exist_ok=True)
     for roi in roi_ids:
         try:
+            if roi not in roi_dirs:
+                raise ValueError(f"Roi folder '{roi}' not found below {args.channels_dir}.")
             output = _run_single_roi(
                 roi=roi,
                 project_root=args.projects_root,
                 config_path=args.config,
-                channel_dirs=channel_dirs,
+                roi_dir=roi_dirs[roi],
                 mask_dir=args.mask_dir,
                 extensions=extensions,
                 overwrite=args.overwrite,
                 debug=args.debug,
+                mask_expand_px=args.mask_expand_px,
             )
             print(f"[{roi}] single-cell collection written to {output}")
         except Exception as exc:  # pragma: no cover - user feedback path
