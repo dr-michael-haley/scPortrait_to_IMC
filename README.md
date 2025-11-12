@@ -38,7 +38,9 @@ Edit `config_imc.yml` to suit your hardware (thread count, output image size, no
 ## Usage
 
 1. Install scPortrait in your environment (`pip install scportrait tifffile`).
-2. Run the helper, pointing it at your IMC folders and config:
+2. Use the helper either via CLI or by importing `process_imc_rois`.
+
+### Command line
 
 ```powershell
 python C:\GitHub\scPortrait_to_IMC\imc_to_single_cells.py `
@@ -56,6 +58,26 @@ Key behaviour:
 - Use `--overwrite` to force regeneration of existing scPortrait project folders.
 - Use `--image-ext` to extend/override the default search extensions (`.tif .tiff .ome.tif .ome.tiff`).
 - Use `--mask-expand-px N` to dilate each labelled cell mask by `N` pixels prior to extraction (helps capture thin membranes).
+
+### From Python
+
+```python
+from pathlib import Path
+from imc_to_single_cells import process_imc_rois
+
+successes, failures = process_imc_rois(
+    channels_dir=Path(r"D:\IMC_RUN\images"),
+    mask_dir=Path(r"D:\IMC_RUN\masks"),
+    projects_root=Path(r"D:\IMC_projects"),
+    config_path=Path(r"C:\GitHub\scPortrait_to_IMC\config_imc.yml"),
+    mask_expand_px=2,
+)
+
+print("Created:", successes)
+print("Failed:", failures)
+```
+
+`successes` maps each ROI name to the generated `single_cells.h5sc` path, while `failures` (if any) maps ROI names to the raised exception for further inspection.
 
 For each ROI `<ID>`, the script creates `--projects-root/<ID>/.../single_cells.h5sc`. Inspect the result with:
 

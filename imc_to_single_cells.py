@@ -11,7 +11,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Sequence
 
 import numpy as np
 from tifffile import imread
@@ -167,6 +167,60 @@ def _run_single_roi(
     return output_file
 
 
+def process_imc_rois(
+    channels_dir: str | Path,
+    mask_dir: str | Path,
+    projects_root: str | Path,
+    config_path: str | Path,
+    roi_list: Sequence[str] | None = None,
+    image_ext: Iterable[str] | None = None,
+    mask_expand_px: int = 0,
+    overwrite: bool = False,
+    debug: bool = False,
+) -> tuple[dict[str, Path], dict[str, Exception]]:
+    """
+    Process IMC ROIs and extract single-cell images via scPortrait.
+
+    Returns:
+        (successes, failures) where `successes` maps ROI -> output h5sc Path and
+        `failures` maps ROI -> raised Exception.
+    """
+    channels_dir = Path(channels_dir)
+    mask_dir = Path(mask_dir)
+    projects_root = Path(projects_root)
+    config_path = Path(config_path)
+
+    extensions = _normalize_ext(image_ext or CHANNEL_EXT_DEFAULT)
+    roi_dirs = {roi_dir.name: roi_dir for roi_dir in _list_roi_dirs(channels_dir)}
+    roi_ids = roi_list or _collect_rois(channels_dir, mask_dir, extensions)
+
+    projects_root.mkdir(parents=True, exist_ok=True)
+
+    successes: dict[str, Path] = {}
+    failures: dict[str, Exception] = {}
+
+    for roi in roi_ids:
+        if roi not in roi_dirs:
+            failures[roi] = KeyError(f"ROI folder '{roi}' not found under {channels_dir}.")
+            continue
+        try:
+            output = _run_single_roi(
+                roi=roi,
+                project_root=projects_root,
+                config_path=config_path,
+                roi_dir=roi_dirs[roi],
+                mask_dir=mask_dir,
+                extensions=extensions,
+                overwrite=overwrite,
+                debug=debug,
+                mask_expand_px=mask_expand_px,
+            )
+            successes[roi] = output
+        except Exception as exc:  # pragma: no cover - runtime path
+            failures[roi] = exc
+    return successes, failures
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Batch IMC extraction with scPortrait (single-mask workflow).")
     parser.add_argument("--channels-dir", required=True, type=Path, help="Folder with one subdirectory per IMC channel.")
@@ -203,31 +257,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    extensions = _normalize_ext(args.image_ext)
-    roi_dirs = {roi_dir.name: roi_dir for roi_dir in _list_roi_dirs(args.channels_dir)}
-    roi_ids = args.roi_list or _collect_rois(args.channels_dir, args.mask_dir, extensions)
+    outputs, errors = process_imc_rois(
+        channels_dir=args.channels_dir,
+        mask_dir=args.mask_dir,
+        projects_root=args.projects_root,
+        config_path=args.config,
+        roi_list=args.roi_list,
+        image_ext=args.image_ext,
+        mask_expand_px=args.mask_expand_px,
+        overwrite=args.overwrite,
+        debug=args.debug,
+    )
 
-    args.projects_root.mkdir(parents=True, exist_ok=True)
-    for roi in roi_ids:
-        try:
-            if roi not in roi_dirs:
-                raise ValueError(f"Roi folder '{roi}' not found below {args.channels_dir}.")
-            output = _run_single_roi(
-                roi=roi,
-                project_root=args.projects_root,
-                config_path=args.config,
-                roi_dir=roi_dirs[roi],
-                mask_dir=args.mask_dir,
-                extensions=extensions,
-                overwrite=args.overwrite,
-                debug=args.debug,
-                mask_expand_px=args.mask_expand_px,
-            )
-            print(f"[{roi}] single-cell collection written to {output}")
-        except Exception as exc:  # pragma: no cover - user feedback path
+    for roi, path in outputs.items():
+        print(f"[{roi}] single-cell collection written to {path}")
+
+    if errors:
+        for roi, exc in errors.items():
             print(f"[{roi}] failed: {exc}", file=sys.stderr)
-            if not args.debug:
-                print("Re-run with --debug for more details.", file=sys.stderr)
+        if not args.debug:
+            print("Re-run with --debug for more details.", file=sys.stderr)
+        return 1
     return 0
 
 
