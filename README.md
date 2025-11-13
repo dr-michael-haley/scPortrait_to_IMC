@@ -49,6 +49,7 @@ python C:\GitHub\scPortrait_to_IMC\imc_to_single_cells.py `
   --mask-dir D:\IMC_RUN\masks `
   --projects-root D:\IMC_projects `
   --config C:\GitHub\scPortrait_to_IMC\config_imc.yml `
+  --panel metadata\panel.csv `
   --mask-expand-px 2
 ```
 
@@ -58,6 +59,7 @@ Key behaviour:
 - Every ROI with both a folder in `--channels-dir` and a mask in `--mask-dir` is processed automatically.
 - Use `--roi ROI_001 --roi ROI_010` to limit the run to specific ROIs.
 - Use `--overwrite` to force regeneration of an existing combined scPortrait project directory.
+- Pass `--panel` to restrict/rename channels via a CSV panel (default `metadata/panel.csv`, use `--panel none` to disable filtering).
 - Use `--image-ext` to extend/override the default search extensions (`.tif .tiff .ome.tif .ome.tiff`).
 - Use `--mask-expand-px N` to dilate each labelled cell mask by `N` pixels prior to extraction (helps capture thin membranes).
 
@@ -80,6 +82,22 @@ print("Failed:", failures)
 ```
 
 `successes` maps each ROI name to the shared `single_cells.h5sc` path, while `failures` (if any) maps ROI names to the raised exception for further inspection. The resulting AnnData receives an `obs["roi"]` column so you can recover the source ROI for every cell.
+
+### Channel panel
+
+Provide a CSV with at least `channel_name`, `channel_label`, and `scportrait` columns (header case-insensitive). Example:
+
+```
+channel_name,channel_label,scportrait
+CD45,CD45,TRUE
+DNA1,Ir191 DNA,FALSE
+PanCK,PanCK,TRUE
+```
+
+- `channel_name` must match the third token in `{chan#}_{roi#}_{channel_name}_{channel_label}.tiff`.
+- Only rows with `scportrait` evaluated to `TRUE/YES/1` are loaded, in the order given by the file.
+- `channel_label` (or the filename fallback) becomes the channel name recorded inside scPortrait.
+- Use `--panel none` to load every channel without filtering.
 
 ### SLURM batch example
 

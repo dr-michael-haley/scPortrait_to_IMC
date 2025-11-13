@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import csv
 import re
 import shutil
 import tempfile
@@ -42,6 +43,14 @@ class ROIContext:
     channel_files: list[Path]
     mask_path: Path
     spatial_shape: tuple[int, int]
+    channel_names: list[str]
+
+
+@dataclass
+class PanelEntry:
+    channel_name: str
+    include: bool
+    label: str | None = None
 
 
 def _normalize_ext(exts: Iterable[str]) -> set[str]:
@@ -80,6 +89,64 @@ def _derive_channel_name(path: Path) -> str:
     if len(parts) == 4:
         return parts[3]
     return stem
+
+
+def _split_channel_components(path: Path) -> tuple[str, str]:
+    stem = path.stem
+    parts = stem.split("_", 3)
+    if len(parts) >= 3:
+        channel_name = parts[2]
+    else:
+        channel_name = stem
+    if len(parts) == 4:
+        channel_label = parts[3]
+    elif len(parts) >= 3:
+        channel_label = parts[2]
+    else:
+        channel_label = stem
+    return channel_name, channel_label
+
+
+def _parse_panel(panel_path: Path | None) -> list[PanelEntry] | None:
+    if panel_path is None:
+        return None
+    panel_path = Path(panel_path)
+    if not panel_path.exists():
+        raise FileNotFoundError(f"Panel file {panel_path} not found.")
+
+    entries: list[PanelEntry] = []
+    with panel_path.open("r", newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None:
+            raise ValueError(f"Panel file {panel_path} is missing a header row.")
+        header = {name.lower(): name for name in reader.fieldnames}
+        name_col = header.get("channel_name")
+        label_col = header.get("channel_label")
+        include_col = header.get("scportrait")
+        if name_col is None or include_col is None:
+            raise ValueError(
+                f"Panel file {panel_path} must contain 'channel_name' and 'scportrait' columns (case-insensitive)."
+            )
+        include_count = 0
+        for row in reader:
+            raw_name = (row.get(name_col) or "").strip()
+            if not raw_name:
+                continue
+            include_raw = (row.get(include_col) or "").strip().lower()
+            include = include_raw in {"true", "1", "yes", "y", "t"}
+            if include:
+                include_count += 1
+            label_value = (row.get(label_col) or "").strip() if label_col else ""
+            entries.append(
+                PanelEntry(
+                    channel_name=raw_name,
+                    include=include,
+                    label=label_value or None,
+                )
+            )
+    if include_count == 0:
+        raise ValueError(f"Panel file {panel_path} has no channels marked with scportrait=True.")
+    return entries
 
 
 def _collect_rois(images_root: Path, mask_dir: Path, extensions: set[str]) -> list[str]:
@@ -126,7 +193,11 @@ def _load_mask(mask_path: Path, expected_shape: tuple[int, int], expand_px: int 
     return mask_data.astype(DEFAULT_SEGMENTATION_DTYPE, copy=False)
 
 
-def _channel_files_and_names(roi_dir: Path, extensions: set[str]) -> tuple[list[str], list[str]]:
+def _channel_files_and_names(
+    roi_dir: Path,
+    extensions: set[str],
+    panel: list[PanelEntry] | None = None,
+) -> tuple[list[str], list[str]]:
     tiffs = sorted(
         [
             path
@@ -137,8 +208,32 @@ def _channel_files_and_names(roi_dir: Path, extensions: set[str]) -> tuple[list[
     )
     if not tiffs:
         raise ValueError(f"No channel images found in {roi_dir}.")
-    files = [str(path) for path in tiffs]
-    names = [_derive_channel_name(path) for path in tiffs]
+    available: dict[str, tuple[Path, str]] = {}
+    for path in tiffs:
+        channel_name, channel_label = _split_channel_components(path)
+        if channel_name in available:
+            raise ValueError(f"Duplicate channel name '{channel_name}' detected in {roi_dir}.")
+        available[channel_name] = (path, channel_label)
+
+    files: list[str] = []
+    names: list[str] = []
+    if panel:
+        for entry in panel:
+            if not entry.include:
+                continue
+            if entry.channel_name not in available:
+                raise FileNotFoundError(
+                    f"Channel '{entry.channel_name}' from panel missing in ROI directory {roi_dir}."
+                )
+            path, fallback_label = available[entry.channel_name]
+            files.append(str(path))
+            names.append(entry.label or fallback_label)
+    else:
+        for path in tiffs:
+            files.append(str(path))
+            names.append(_derive_channel_name(path))
+    if not files:
+        raise ValueError(f"No channels remained after panel filtering for ROI {roi_dir.name}.")
     return files, names
 
 
@@ -320,6 +415,7 @@ def process_imc_rois(
     mask_dir: str | Path,
     projects_root: str | Path,
     config_path: str | Path,
+    panel_path: Path | None = None,
     roi_list: Sequence[str] | None = None,
     image_ext: Iterable[str] | None = None,
     mask_expand_px: int = 0,
@@ -329,6 +425,10 @@ def process_imc_rois(
     """
     Process IMC ROIs and extract single-cell images via scPortrait using a single combined project.
 
+    Args:
+        panel_path: Optional CSV file describing channel_name, channel_label, and a boolean
+            `scportrait` column indicating whether the channel should be included.
+
     Returns:
         (successes, failures) where `successes` maps each successfully processed ROI
         to the shared output h5sc Path and `failures` maps ROI -> raised Exception.
@@ -337,6 +437,7 @@ def process_imc_rois(
     mask_dir = Path(mask_dir)
     projects_root = Path(projects_root)
     config_path = Path(config_path)
+    panel_entries = _parse_panel(panel_path)
 
     extensions = _normalize_ext(image_ext or CHANNEL_EXT_DEFAULT)
     roi_dirs = {roi_dir.name: roi_dir for roi_dir in _list_roi_dirs(channels_dir)}
@@ -355,7 +456,7 @@ def process_imc_rois(
             failures[roi] = KeyError(f"ROI folder '{roi}' not found under {channels_dir}.")
             continue
         try:
-            channel_files, channel_names = _channel_files_and_names(roi_dirs[roi], extensions)
+            channel_files, channel_names = _channel_files_and_names(roi_dirs[roi], extensions, panel_entries)
             example_image = imread(channel_files[0])
             spatial_shape = _spatial_shape(example_image.shape)
             mask_path = _resolve_file(mask_dir, roi, extensions)
@@ -375,6 +476,7 @@ def process_imc_rois(
                 channel_files=[Path(p) for p in channel_files],
                 mask_path=mask_path,
                 spatial_shape=spatial_shape,
+                channel_names=channel_names,
             )
         )
 
@@ -436,6 +538,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--config", required=True, type=Path, help="scPortrait config.yml containing HDF5CellExtraction.")
     parser.add_argument(
+        "--panel",
+        type=str,
+        default="metadata/panel.csv",
+        help="Path to channel panel CSV (set to 'none' to disable; default: metadata/panel.csv).",
+    )
+    parser.add_argument(
         "--roi",
         action="append",
         dest="roi_list",
@@ -460,11 +568,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    panel_arg = (args.panel or "").strip()
+    if panel_arg and panel_arg.lower() not in {"none", "null", "false"}:
+        panel_path: Path | None = Path(panel_arg)
+    else:
+        panel_path = None
     outputs, errors = process_imc_rois(
         channels_dir=args.channels_dir,
         mask_dir=args.mask_dir,
         projects_root=args.projects_root,
         config_path=args.config,
+        panel_path=panel_path,
         roi_list=args.roi_list,
         image_ext=args.image_ext,
         mask_expand_px=args.mask_expand_px,
