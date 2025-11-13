@@ -245,6 +245,7 @@ def _annotate_roi_membership(output_file: Path, roi_ranges: dict[str, tuple[int,
         roi_labels[mask] = roi
 
     adata.obs["roi"] = roi_labels
+    output_file.unlink(missing_ok=True)
     adata.write_h5ad(output_file)
 
 
