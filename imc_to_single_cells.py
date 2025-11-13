@@ -248,6 +248,18 @@ def _annotate_roi_membership(output_file: Path, roi_ranges: dict[str, tuple[int,
     adata.write_h5ad(output_file)
 
 
+def _ensure_cache_directory(cache_value: str | None) -> None:
+    if not cache_value:
+        return
+    cache_path = Path(cache_value)
+    if cache_path.is_absolute():
+        target = cache_path
+    else:
+        tmp_root = Path(tempfile.gettempdir())
+        target = tmp_root / cache_path
+    target.mkdir(parents=True, exist_ok=True)
+
+
 def _run_combined_project(
     project_dir: Path,
     config_path: Path,
@@ -277,6 +289,8 @@ def _run_combined_project(
             overwrite=True,
             cache=cache_token,
         )
+        extraction_cfg = project.config.get("HDF5CellExtraction", {})
+        _ensure_cache_directory(extraction_cfg.get("cache"))
 
         project.filehandler._write_segmentation_sdata(
             mask,
