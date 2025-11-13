@@ -10,19 +10,36 @@ from __future__ import annotations
 
 import argparse
 import sys
+from dataclasses import dataclass
+import re
+import shutil
 from pathlib import Path
 from typing import Iterable, Sequence
 
 import numpy as np
-from tifffile import imread
+from tifffile import imread, imwrite
 from skimage.segmentation import expand_labels
 
-from scportrait.pipeline._utils.constants import DEFAULT_SEGMENTATION_DTYPE
+from scportrait.io.h5sc import read_h5sc
+from scportrait.pipeline._utils.constants import (
+    DEFAULT_CELL_ID_NAME,
+    DEFAULT_IMAGE_DTYPE,
+    DEFAULT_SEGMENTATION_DTYPE,
+)
 from scportrait.pipeline.extraction import HDF5CellExtraction
 from scportrait.pipeline.project import Project
 
 
 CHANNEL_EXT_DEFAULT = [".tif", ".tiff", ".ome.tif", ".ome.tiff"]
+ROI_VERTICAL_SPACING = 32
+
+
+@dataclass
+class ROIContext:
+    name: str
+    channel_files: list[Path]
+    mask_path: Path
+    spatial_shape: tuple[int, int]
 
 
 def _normalize_ext(exts: Iterable[str]) -> set[str]:
@@ -123,27 +140,124 @@ def _channel_files_and_names(roi_dir: Path, extensions: set[str]) -> tuple[list[
     return files, names
 
 
-def _run_single_roi(
-    roi: str,
-    project_root: Path,
+def _safe_channel_filename(index: int, name: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._")
+    if not slug:
+        slug = f"channel_{index:03d}"
+    return f"{index:03d}_{slug}.tif"
+
+
+def _compute_canvas_layout(contexts: Sequence[ROIContext], spacing: int = ROI_VERTICAL_SPACING) -> tuple[int, int, dict[str, tuple[int, int]]]:
+    if not contexts:
+        raise ValueError("No ROI contexts available to build canvas layout.")
+    max_width = max(ctx.spatial_shape[1] for ctx in contexts)
+    total_height = sum(ctx.spatial_shape[0] for ctx in contexts)
+    if len(contexts) > 1:
+        total_height += spacing * (len(contexts) - 1)
+    offsets: dict[str, tuple[int, int]] = {}
+    cursor = 0
+    for ctx in contexts:
+        offsets[ctx.name] = (cursor, cursor + ctx.spatial_shape[0])
+        cursor += ctx.spatial_shape[0] + spacing
+    return total_height, max_width, offsets
+
+
+def _write_combined_channel_images(
+    contexts: Sequence[ROIContext],
+    channel_names: list[str],
+    offsets: dict[str, tuple[int, int]],
+    assembled_dir: Path,
+    canvas_height: int,
+    canvas_width: int,
+) -> list[str]:
+    assembled_dir.mkdir(parents=True, exist_ok=True)
+    channel_paths: list[str] = []
+    for idx, channel_name in enumerate(channel_names):
+        canvas = np.zeros((canvas_height, canvas_width), dtype=DEFAULT_IMAGE_DTYPE)
+        for ctx in contexts:
+            start_y, end_y = offsets[ctx.name]
+            tile = imread(ctx.channel_files[idx])
+            tile = np.squeeze(tile)
+            tile = np.asarray(tile, dtype=DEFAULT_IMAGE_DTYPE, order="C")
+            height, width = tile.shape
+            if height != ctx.spatial_shape[0] or width != ctx.spatial_shape[1]:
+                raise ValueError(
+                    f"Channel '{channel_name}' for ROI '{ctx.name}' has unexpected shape {(height, width)}, expected {ctx.spatial_shape}."
+                )
+            canvas[start_y:end_y, 0:width] = tile
+        filename = _safe_channel_filename(idx, channel_name)
+        out_path = assembled_dir / filename
+        imwrite(out_path, canvas)
+        channel_paths.append(str(out_path))
+    return channel_paths
+
+
+def _assemble_combined_mask(
+    contexts: Sequence[ROIContext],
+    offsets: dict[str, tuple[int, int]],
+    canvas_height: int,
+    canvas_width: int,
+    mask_expand_px: int,
+) -> tuple[np.ndarray, dict[str, tuple[int, int]]]:
+    combined = np.zeros((canvas_height, canvas_width), dtype=DEFAULT_SEGMENTATION_DTYPE)
+    roi_cell_ranges: dict[str, tuple[int, int]] = {}
+    next_offset = 0
+    for ctx in contexts:
+        start_y, end_y = offsets[ctx.name]
+        mask = _load_mask(ctx.mask_path, ctx.spatial_shape, expand_px=mask_expand_px)
+        mask = np.asarray(mask, dtype=DEFAULT_SEGMENTATION_DTYPE, order="C")
+        non_zero = mask > 0
+        if np.any(non_zero):
+            roi_values = mask[non_zero]
+            roi_min = int(roi_values.min())
+            roi_max = int(roi_values.max())
+            range_start = next_offset + roi_min
+            range_end = next_offset + roi_max
+            roi_cell_ranges[ctx.name] = (range_start, range_end)
+            mask[non_zero] = roi_values + next_offset
+            next_offset = range_end
+        else:
+            roi_cell_ranges[ctx.name] = (0, 0)
+        combined[start_y:end_y, 0 : mask.shape[1]] = mask
+    return combined, roi_cell_ranges
+
+
+def _annotate_roi_membership(output_file: Path, roi_ranges: dict[str, tuple[int, int]]) -> None:
+    if not roi_ranges:
+        return
+    try:
+        adata = read_h5sc(str(output_file))
+    except Exception as exc:  # pragma: no cover - runtime safeguard
+        print(f"Failed to annotate ROI membership: {exc}", file=sys.stderr)
+        return
+
+    if DEFAULT_CELL_ID_NAME not in adata.obs:
+        return
+
+    cell_ids = adata.obs[DEFAULT_CELL_ID_NAME].to_numpy()
+    roi_labels = np.full(cell_ids.shape, "unassigned", dtype=object)
+    for roi, (start_id, end_id) in roi_ranges.items():
+        if start_id == 0 and end_id == 0:
+            continue
+        mask = (cell_ids >= start_id) & (cell_ids <= end_id)
+        roi_labels[mask] = roi
+
+    adata.obs["roi"] = roi_labels
+    adata.write_h5ad(output_file)
+
+
+def _run_combined_project(
+    project_dir: Path,
     config_path: Path,
-    roi_dir: Path,
-    mask_dir: Path,
-    extensions: set[str],
+    channel_files: list[str],
+    channel_names: list[str],
+    mask: np.ndarray,
     overwrite: bool,
     debug: bool,
-    mask_expand_px: int,
 ) -> Path:
-    project_dir = project_root / roi
     project_dir.mkdir(parents=True, exist_ok=True)
     cache_dir = project_dir / "cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
-
-    channel_files, channel_names = _channel_files_and_names(roi_dir, extensions)
-    example_image = imread(channel_files[0])
-    spatial_shape = _spatial_shape(example_image.shape)
-    mask_path = _resolve_file(mask_dir, roi, extensions)
-    mask = _load_mask(mask_path, spatial_shape, expand_px=mask_expand_px)
 
     project = Project(
         project_location=str(project_dir),
@@ -191,11 +305,11 @@ def process_imc_rois(
     debug: bool = False,
 ) -> tuple[dict[str, Path], dict[str, Exception]]:
     """
-    Process IMC ROIs and extract single-cell images via scPortrait.
+    Process IMC ROIs and extract single-cell images via scPortrait using a single combined project.
 
     Returns:
-        (successes, failures) where `successes` maps ROI -> output h5sc Path and
-        `failures` maps ROI -> raised Exception.
+        (successes, failures) where `successes` maps each successfully processed ROI
+        to the shared output h5sc Path and `failures` maps ROI -> raised Exception.
     """
     channels_dir = Path(channels_dir)
     mask_dir = Path(mask_dir)
@@ -211,25 +325,80 @@ def process_imc_rois(
     successes: dict[str, Path] = {}
     failures: dict[str, Exception] = {}
 
+    contexts: list[ROIContext] = []
+    channel_names_template: list[str] | None = None
+
     for roi in roi_ids:
         if roi not in roi_dirs:
             failures[roi] = KeyError(f"ROI folder '{roi}' not found under {channels_dir}.")
             continue
         try:
-            output = _run_single_roi(
-                roi=roi,
-                project_root=projects_root,
-                config_path=config_path,
-                roi_dir=roi_dirs[roi],
-                mask_dir=mask_dir,
-                extensions=extensions,
-                overwrite=overwrite,
-                debug=debug,
-                mask_expand_px=mask_expand_px,
-            )
-            successes[roi] = output
-        except Exception as exc:  # pragma: no cover - runtime path
+            channel_files, channel_names = _channel_files_and_names(roi_dirs[roi], extensions)
+            example_image = imread(channel_files[0])
+            spatial_shape = _spatial_shape(example_image.shape)
+            mask_path = _resolve_file(mask_dir, roi, extensions)
+        except Exception as exc:
             failures[roi] = exc
+            continue
+
+        if channel_names_template is None:
+            channel_names_template = channel_names
+        elif channel_names_template != channel_names:
+            failures[roi] = ValueError(f"Channel list for ROI '{roi}' does not match the first ROI.")
+            continue
+
+        contexts.append(
+            ROIContext(
+                name=roi,
+                channel_files=[Path(p) for p in channel_files],
+                mask_path=mask_path,
+                spatial_shape=spatial_shape,
+            )
+        )
+
+    if not contexts:
+        return successes, failures
+    if channel_names_template is None:
+        raise RuntimeError("Unable to determine channel names for the combined project.")
+
+    assembled_dir = projects_root / "assembled_channels"
+    if assembled_dir.exists():
+        shutil.rmtree(assembled_dir, ignore_errors=True)
+
+    canvas_height, canvas_width, offsets = _compute_canvas_layout(contexts)
+    aggregated_channel_files = _write_combined_channel_images(
+        contexts,
+        channel_names_template or [],
+        offsets,
+        assembled_dir,
+        canvas_height,
+        canvas_width,
+    )
+    combined_mask, roi_ranges = _assemble_combined_mask(
+        contexts,
+        offsets,
+        canvas_height,
+        canvas_width,
+        mask_expand_px,
+    )
+
+    try:
+        output = _run_combined_project(
+            project_dir=projects_root,
+            config_path=config_path,
+            channel_files=aggregated_channel_files,
+            channel_names=channel_names_template or [],
+            mask=combined_mask,
+            overwrite=overwrite,
+            debug=debug,
+        )
+    finally:
+        shutil.rmtree(assembled_dir, ignore_errors=True)
+
+    _annotate_roi_membership(output, roi_ranges)
+
+    for ctx in contexts:
+        successes[ctx.name] = output
     return successes, failures
 
 

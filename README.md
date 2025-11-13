@@ -54,9 +54,10 @@ python C:\GitHub\scPortrait_to_IMC\imc_to_single_cells.py `
 
 Key behaviour:
 
+- All valid ROIs are merged into a single scPortrait project located exactly at `--projects-root`.
 - Every ROI with both a folder in `--channels-dir` and a mask in `--mask-dir` is processed automatically.
 - Use `--roi ROI_001 --roi ROI_010` to limit the run to specific ROIs.
-- Use `--overwrite` to force regeneration of existing scPortrait project folders.
+- Use `--overwrite` to force regeneration of an existing combined scPortrait project directory.
 - Use `--image-ext` to extend/override the default search extensions (`.tif .tiff .ome.tif .ome.tiff`).
 - Use `--mask-expand-px N` to dilate each labelled cell mask by `N` pixels prior to extraction (helps capture thin membranes).
 
@@ -78,7 +79,7 @@ print("Created:", successes)
 print("Failed:", failures)
 ```
 
-`successes` maps each ROI name to the generated `single_cells.h5sc` path, while `failures` (if any) maps ROI names to the raised exception for further inspection.
+`successes` maps each ROI name to the shared `single_cells.h5sc` path, while `failures` (if any) maps ROI names to the raised exception for further inspection. The resulting AnnData receives an `obs["roi"]` column so you can recover the source ROI for every cell.
 
 ### SLURM batch example
 
@@ -90,16 +91,17 @@ sbatch C:\GitHub\scPortrait_to_IMC\run_imc.slurm
 
 Adjust the SBATCH resources, module/conda commands, and file paths inside the script to match your cluster environment. Logs land in `run_imc.slurm`'s `logs/` folder (created automatically by SLURM).
 
-For each ROI `<ID>`, the script creates `--projects-root/<ID>/.../single_cells.h5sc`. Inspect the result with:
+All ROIs land in `--projects-root/extraction/data/single_cells.h5sc`. Inspect the result with:
 
 ```python
 from scportrait.io.h5sc import read_h5sc
-adata = read_h5sc(r"D:\IMC_projects\ROI_001\extraction\data\single_cells.h5sc")
+adata = read_h5sc(r"D:\IMC_projects\extraction\data\single_cells.h5sc")
 print(adata.obsm["single_cell_images"].shape)
+print(adata.obs["roi"].value_counts())
 ```
 
 ## Verification checklist
 
-- Confirm that `D:\IMC_projects\<ROI>\extraction\data\single_cells.h5sc` exists for every ROI.
-- Load the file via `read_h5sc` to ensure the AnnData object contains the expected number of cells/channels.
+- Confirm that `D:\IMC_projects\extraction\data\single_cells.h5sc` exists after the run.
+- Load the file via `read_h5sc` to ensure the AnnData object contains the expected number of cells/channels and inspect `obs["roi"]`.
 - Re-run with `--debug` to view detailed logs if a ROI fails.
