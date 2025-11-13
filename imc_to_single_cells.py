@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import argparse
 import sys
-from dataclasses import dataclass
 import re
 import shutil
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
+from uuid import uuid4
 
 import numpy as np
 from tifffile import imread, imwrite
@@ -256,7 +258,9 @@ def _run_combined_project(
     debug: bool,
 ) -> Path:
     project_dir.mkdir(parents=True, exist_ok=True)
-    cache_dir = project_dir / "cache"
+    tmp_root = Path(tempfile.gettempdir())
+    cache_token = f"scportrait_imc_cache_{uuid4().hex[:8]}"
+    cache_dir = tmp_root / cache_token
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     project = Project(
@@ -266,23 +270,26 @@ def _run_combined_project(
         overwrite=overwrite,
         debug=debug,
     )
-    project.load_input_from_tif_files(
-        channel_files,
-        channel_names=channel_names,
-        overwrite=True,
-        cache=str(cache_dir),
-    )
+    try:
+        project.load_input_from_tif_files(
+            channel_files,
+            channel_names=channel_names,
+            overwrite=True,
+            cache=cache_token,
+        )
 
-    project.filehandler._write_segmentation_sdata(
-        mask,
-        project.cyto_seg_name,
-        chunks=project.DEFAULT_CHUNK_SIZE_2D,
-        overwrite=True,
-    )
-    project.filehandler._add_centers(project.cyto_seg_name, overwrite=True)
-    project.extraction_f.register_parameter("segmentation_mask", project.cyto_seg_name)
+        project.filehandler._write_segmentation_sdata(
+            mask,
+            project.cyto_seg_name,
+            chunks=project.DEFAULT_CHUNK_SIZE_2D,
+            overwrite=True,
+        )
+        project.filehandler._add_centers(project.cyto_seg_name, overwrite=True)
+        project.extraction_f.register_parameter("segmentation_mask", project.cyto_seg_name)
 
-    project.extract(overwrite=overwrite)
+        project.extract(overwrite=overwrite)
+    finally:
+        shutil.rmtree(cache_dir, ignore_errors=True)
 
     output_file = (
         Path(project.project_location)
