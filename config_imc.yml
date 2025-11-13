@@ -6,4 +6,4 @@ HDF5CellExtraction:
   normalize_output: true
   normalization_range: [0.01, 0.99]
   compression: "lzf"
-  cache: "./cache"
+  cache: "/tmp/scportrait_cache"
