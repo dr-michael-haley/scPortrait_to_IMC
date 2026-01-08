@@ -295,9 +295,10 @@ def _assemble_combined_mask(
     canvas_height: int,
     canvas_width: int,
     mask_expand_px: int,
-) -> tuple[np.ndarray, dict[str, tuple[int, int]]]:
+) -> tuple[np.ndarray, dict[str, tuple[int, int]], list[tuple[str, int, int]]]:
     combined = np.zeros((canvas_height, canvas_width), dtype=DEFAULT_SEGMENTATION_DTYPE)
     roi_cell_ranges: dict[str, tuple[int, int]] = {}
+    roi_cell_id_map: list[tuple[str, int, int]] = []
     next_offset = 0
     for ctx in contexts:
         start_y, end_y = offsets[ctx.name]
@@ -305,7 +306,13 @@ def _assemble_combined_mask(
         mask = np.asarray(mask, dtype=DEFAULT_SEGMENTATION_DTYPE, order="C")
         non_zero = mask > 0
         if np.any(non_zero):
+            base_offset = next_offset
             roi_values = mask[non_zero]
+            unique_ids = np.unique(roi_values).astype(np.int64, copy=False)
+            new_ids = unique_ids + base_offset
+            roi_cell_id_map.extend(
+                [(ctx.name, int(original_id), int(new_id)) for original_id, new_id in zip(unique_ids, new_ids)]
+            )
             roi_min = int(roi_values.min())
             roi_max = int(roi_values.max())
             range_start = next_offset + roi_min
@@ -316,11 +323,25 @@ def _assemble_combined_mask(
         else:
             roi_cell_ranges[ctx.name] = (0, 0)
         combined[start_y:end_y, 0 : mask.shape[1]] = mask
-    return combined, roi_cell_ranges
+    return combined, roi_cell_ranges, roi_cell_id_map
 
 
-def _annotate_roi_membership(output_file: Path, roi_ranges: dict[str, tuple[int, int]]) -> None:
-    if not roi_ranges:
+def _write_roi_cell_id_map_csv(output_path: Path, rows: Sequence[tuple[str, int, int]]) -> None:
+    if not rows:
+        return
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["roi", "original_object_id", "new_object_id"])
+        writer.writerows(rows)
+
+
+def _annotate_roi_membership(
+    output_file: Path,
+    roi_ranges: dict[str, tuple[int, int]],
+    roi_cell_id_map: Sequence[tuple[str, int, int]] | None = None,
+) -> None:
+    if not roi_ranges and not roi_cell_id_map:
         return
     try:
         adata = read_h5sc(str(output_file))
@@ -333,13 +354,32 @@ def _annotate_roi_membership(output_file: Path, roi_ranges: dict[str, tuple[int,
 
     cell_ids = adata.obs[DEFAULT_CELL_ID_NAME].to_numpy()
     roi_labels = np.full(cell_ids.shape, "unassigned", dtype=object)
-    for roi, (start_id, end_id) in roi_ranges.items():
-        if start_id == 0 and end_id == 0:
-            continue
-        mask = (cell_ids >= start_id) & (cell_ids <= end_id)
-        roi_labels[mask] = roi
+    original_object_ids = np.full(cell_ids.shape, -1, dtype=np.int64)
+
+    lookup: dict[int, tuple[str, int]] = {}
+    if roi_cell_id_map:
+        # new_id is globally unique; map new_id -> (roi, original_id)
+        lookup = {int(new_id): (roi, int(original_id)) for roi, original_id, new_id in roi_cell_id_map}
+        for idx, cell_id in enumerate(cell_ids):
+            try:
+                key = int(cell_id)
+            except Exception:
+                continue
+            hit = lookup.get(key)
+            if hit is None:
+                continue
+            roi, original_id = hit
+            roi_labels[idx] = roi
+            original_object_ids[idx] = original_id
+    else:
+        for roi, (start_id, end_id) in roi_ranges.items():
+            if start_id == 0 and end_id == 0:
+                continue
+            mask = (cell_ids >= start_id) & (cell_ids <= end_id)
+            roi_labels[mask] = roi
 
     adata.obs["roi"] = roi_labels
+    adata.obs["original_object_id"] = original_object_ids
     output_file.unlink(missing_ok=True)
     adata.write_h5ad(output_file)
 
@@ -498,7 +538,7 @@ def process_imc_rois(
         canvas_height,
         canvas_width,
     )
-    combined_mask, roi_ranges = _assemble_combined_mask(
+    combined_mask, roi_ranges, roi_cell_id_map = _assemble_combined_mask(
         contexts,
         offsets,
         canvas_height,
@@ -519,7 +559,9 @@ def process_imc_rois(
     finally:
         shutil.rmtree(assembled_dir, ignore_errors=True)
 
-    _annotate_roi_membership(output, roi_ranges)
+    _annotate_roi_membership(output, roi_ranges, roi_cell_id_map)
+
+    _write_roi_cell_id_map_csv(output.parent / "roi_cell_id_map.csv", roi_cell_id_map)
 
     for ctx in contexts:
         successes[ctx.name] = output
