@@ -578,7 +578,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         help="Directory where per-ROI scPortrait projects will be created.",
     )
-    parser.add_argument("--config", required=True, type=Path, help="scPortrait config.yml containing HDF5CellExtraction.")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("scportrait_config.yml"),
+        help="scPortrait config.yml containing HDF5CellExtraction (default: ./scportrait_config.yml).",
+    )
+    
     parser.add_argument(
         "--panel",
         type=str,
